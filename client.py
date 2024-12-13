@@ -1,5 +1,6 @@
 import threading
 import socket
+import pickle
 
 
 class Client:
@@ -25,22 +26,26 @@ class Client:
     def receive_messages(self):
         while True:
             try:
-                data: bytes = self.sock.recv(Client.BUFFER_SIZE)
+                try:
+                    data: str = pickle.loads(self.sock.recv(Client.BUFFER_SIZE))
+                except (EOFError, pickle.UnpicklingError):
+                    data: None = None
             except Exception:
                 self.sock.close()
                 break
-            msg: str = data.decode('utf-8')
-            print(msg)
+
+            if data:
+                print(data)
 
     def send_messages(self):
         while True:
             msg: str = input()
-            data: bytes = msg.encode()
+            data: bytes = pickle.dumps(msg)
             self.sock.send(data)
             print("Sent")
 
             if msg.lower() == "quit":
-                print(self.sock.recv(Client.BUFFER_SIZE).decode('utf-8'))
+                print(pickle.loads(self.sock.recv(Client.BUFFER_SIZE)))
                 self.sock.close()
                 break
 

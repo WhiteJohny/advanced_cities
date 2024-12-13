@@ -1,5 +1,6 @@
 import socket
 import threading
+import pickle
 
 from queue import Queue
 from random import choice
@@ -20,7 +21,7 @@ class Room:
         self.turn = choice(self.players)
 
         for player in self.players:
-            player.send("Game is starting!".encode())
+            player.send(pickle.dumps("Game is starting!"))
 
         timer = self.change_turn()
         while True:
@@ -29,7 +30,7 @@ class Room:
                 self.clear()
                 self.run()
                 break
-            elif self.game_status in [2, 3]:
+            elif self.game_status in [2, 3, 4]:
                 timer.cancel()
                 self.clear()
                 break
@@ -40,23 +41,23 @@ class Room:
                 if conn == self.turn:
                     if self.valid_city(msg):
                         timer.cancel()
-                        another_conn.send(f"Your opponent named the city: {msg}.\n"
-                                          f"You should name the city on letter '{msg[-1]}'.\n"
-                                          f"Last cities: {self.last_cities}".encode())
+                        another_conn.send(pickle.dumps(f"Your opponent named the city: {msg}.\n"
+                                                       f"You should name the city on letter '{msg[-1]}'.\n"
+                                                       f"Last cities: {self.last_cities}"))
                         timer = self.change_turn()
                 else:
-                    conn.send("Wait for your turn!".encode())
+                    conn.send(pickle.dumps("Wait for your turn!"))
 
     def loose_game(self, conn: socket.socket, another_conn: socket.socket):
         self.game_status = 1
-        conn.send("Time is up, you lose!".encode())
-        another_conn.send("Time of your opponent is up, you win!".encode())
+        conn.send(pickle.dumps("Time is up, you lose!"))
+        another_conn.send(pickle.dumps("Time of your opponent is up, you win!"))
         print("game over! | loose")
 
     def change_turn(self):
         another_conn = self.turn
         self.turn = self.players[0] if self.players[0] != self.turn else self.players[1]
-        self.turn.send("Now your turn!".encode())
+        self.turn.send(pickle.dumps("Now your turn!"))
         timer = threading.Timer(interval=15, function=self.loose_game, args=(self.turn, another_conn))
         timer.start()
         return timer
@@ -68,7 +69,7 @@ class Room:
         elif city[0] == self.last_cities[-1][-1] and city not in self.last_cities:
             self.last_cities.append(city)
         else:
-            self.turn.send('This city starts with wrong letter or named before'.encode())
+            self.turn.send(pickle.dumps('This city starts with wrong letter or named before'))
             flag = False
 
         return flag
@@ -116,19 +117,32 @@ class Server(threading.Thread):
         print('socket is listening now')
 
         self.clients: list[socket.socket] = []
+        self.admins: list[socket.socket] = []
+        self.ban_list: list[socket.socket] = []
         self.rooms: list[Room] = [Room(i) for i in range(1, rooms_count + 1)]
 
     def run(self):
         while True:
             conn, address = self.sock.accept()
             print(f'new connection {address}')
-            self.clients.append(conn)
-            threading.Thread(target=self.handling_client, args=(conn, address)).start()
-            print(f"handling new client {address}")
+
+            if address in self.ban_list:
+                conn.send("You have banned!")
+                conn.close()
+            else:
+                if len(self.clients) == 0:
+                    self.admins.append(conn)
+
+                self.clients.append(conn)
+                threading.Thread(target=self.handling_client, args=(conn, address)).start()
+                print(f"handling new client {address}")
 
     def handling_client(self, conn: socket.socket, address: str):
         print(f"finding room for {address}")
         room = self.find_room(conn)
+        if not room:
+            return
+
         client_queue = Queue()
         print(f"{address} join in {room.number}")
 
@@ -147,52 +161,76 @@ class Server(threading.Thread):
     def receive_messages(conn: socket.socket, client_queue: Queue):
         while True:
             try:
-                data: bytes = conn.recv(Server.BUFFER_SIZE)
+                try:
+                    data: str = pickle.loads(conn.recv(Server.BUFFER_SIZE))
+                except EOFError:
+                    data: None = None
             except Exception:
-                client_queue.put("QUIT".encode())
+                client_queue.put(pickle.dumps("QUIT"))
                 break
-            client_queue.put(data)
-            if data.decode().upper() in ("QUIT", "CHANGE"):
-                break
+
+            if data:
+                client_queue.put(pickle.dumps(data))
+                if data.upper() in ("QUIT", "CHANGE"):
+                    break
 
     def process_messages(self, conn: socket.socket, room: Room, client_queue: Queue):
         while True:
             if not client_queue.empty():
-                data: bytes = client_queue.get()
-                msg: str = data.decode().upper()
-
-                if msg == "QUIT":
+                data: str = pickle.loads(client_queue.get()).upper()
+                print(data, "process")
+                if data == "QUIT":
                     self.exit_game(conn, room)
                     break
-                elif msg == "CHANGE":
+                elif data == "CHANGE":
                     self.change_room(conn, room)
                     break
+                elif data == "BAN":
+                    if room.is_full():
+                        room.game_status = 4
+                        another_conn = room.players[0] if conn != room.players[0] else room.players[1]
+                        self.ban_player(conn, another_conn)
+                    else:
+                        conn.send(pickle.dumps("No opponent in your room!"))
 
                 if room.game_status == 0:
-                    room.queue.put((conn, msg))
+                    room.queue.put((conn, data))
                 else:
-                    conn.send("Wait for your opponent..".encode())
+                    conn.send(pickle.dumps("Wait for your opponent.."))
 
-    def find_room(self, conn):
+    def find_room(self, conn: socket.socket) -> Room:
         while True:
-            conn.send(f"Choose room to play.\nAvailable rooms: {self.rooms}".encode())
-            data: bytes = conn.recv(Server.BUFFER_SIZE)
+            conn.send(pickle.dumps(f"Choose room to play.\nAvailable rooms: {self.rooms}"))
+            try:
+                data: bytes = pickle.loads(conn.recv(Server.BUFFER_SIZE))
+                room_number = data
+            except Exception:
+                room = None
+                conn.close()
+                print(f"{conn} lost connection!")
+                break
 
-            room_number = data.decode()
+            if room_number.upper() == "QUIT":
+                room = None
+                conn.send(pickle.dumps("You left!"))
+                conn.close()
+                print(f"{conn} left!")
+                break
+
             if room_number.isdigit():
                 room_number = int(room_number)
                 if 1 <= room_number <= len(self.rooms):
                     if not self.rooms[room_number - 1].is_full():
                         room = self.rooms[room_number - 1]
                         room.add_player(conn)
-                        conn.send(f"You joined in {room.number}!".encode())
+                        conn.send(pickle.dumps(f"You joined in {room.number}!"))
                         break
                     else:
-                        conn.send("That room is full!".encode())
+                        conn.send(pickle.dumps("That room is full!"))
                 else:
-                    conn.send("That room does not exist!".encode())
+                    conn.send(pickle.dumps("That room does not exist!"))
             else:
-                conn.send("Wrong room number!".encode())
+                conn.send(pickle.dumps("Wrong room number!"))
 
         return room
 
@@ -200,12 +238,12 @@ class Server(threading.Thread):
     def change_room(conn: socket.socket, room: Room):
         room.game_status = 2
         if room.is_full():
-            conn.send("You lose!".encode())
+            conn.send(pickle.dumps("You lose!"))
             another_conn = room.players[1 - room.players.index(conn)]
             another_conn.send("Your opponent left, you win!".encode())
             print("game over!", end=" | ")
 
-        conn.send("You left the room!".encode())
+        conn.send(pickle.dumps("You left the room!"))
         room.remove_player(conn)
         server.handling_client(conn, "address")
         print(f"{conn} changed room")
@@ -217,18 +255,27 @@ class Server(threading.Thread):
             try:
                 conn.send("You lose!".encode())
                 another_conn = room.players[1 - room.players.index(conn)]
-                another_conn.send("Your opponent left, you win!".encode())
+                another_conn.send(pickle.dumps("Your opponent left, you win!"))
             except Exception:
                 pass
             print("game over!", end=" | ")
 
         try:
-            conn.send("You left!".encode())
+            conn.send(pickle.dumps("You left!"))
         except Exception:
             pass
         room.remove_player(conn)
         conn.close()
         print(f"{conn} left")
+
+    def ban_player(self, conn: socket.socket, another_conn: socket.socket):
+        if conn in self.admins:
+            self.ban_list.append(conn)
+            another_conn.send(pickle.dumps("You have banned!"))
+            another_conn.close()
+            print(f"{conn} banned {another_conn}")
+        else:
+            conn.send(pickle.dumps("You do not have permission to use this command!"))
 
 
 server = Server(rooms_count=10)
